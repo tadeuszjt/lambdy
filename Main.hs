@@ -2,6 +2,9 @@
 module Main where
 
 import Data.Char
+import Data.Maybe
+import Data.List
+import qualified Data.Set as Set
 import Data.Either
 import Control.Applicative hiding (Const)
 import Control.Monad hiding (function)
@@ -33,28 +36,12 @@ run :: FunPtr a -> IO Int
 run fn = mkFun (castFunPtr fn :: FunPtr (IO Int))
 
 
-data Operator
-    = Plus
-    | Minus
-    | Times
-    | Divide
-    deriving (Show, Eq)
-
-
 data Token
     = TokSym   Char
+    | TokArr
     | TokInt   Int
     | TokIdent String
-    | TokEnd
-    deriving (Show, Eq)
-
-
-data Expr
-    = Lamb  Expr Expr
-    | App   Expr Expr
-    | Const Int
-    | Ident String
-    deriving (Show, Eq)
+    deriving (Show, Eq, Ord)
 
 
 newtype Parser a 
@@ -77,20 +64,19 @@ instance Alternative Parser where
     empty     = Parser $ \toks -> []
     pa <|> pb = Parser $ \toks -> (getParser pa) toks ++ (getParser pb) toks
     
-
 instance MonadFail Parser where
     fail = error
 
 
-syms = ['+', '-', '*', '/', '\\', '.']
+syms = ['+', '-', '*', '/', '\\', '.', '(', ')']
 
 
 lexToken :: String -> (Token, String) 
 lexToken s = case s of
+    '-':'>':ss           -> (TokArr, ss)
     c:ss | c `elem` syms -> (TokSym c, ss)
     c:_  | isDigit c     -> (TokInt (read $ takeWhile isDigit s), dropWhile isDigit s)
     c:_  | isAlpha c     -> (TokIdent (takeWhile isAlpha s), dropWhile isAlpha s)
-    ""                   -> (TokEnd, "")
     ' ':ss               -> lexToken ss
     _                    -> error ("lex error at: " ++ s)
 
@@ -101,36 +87,50 @@ lexTokens s = case lexToken s of
     (tok, s)  -> (tok:lexTokens s)
 
 
+-- <expr> ::= <var>
+--         |  '\' <var>+ '->' <expr>
+--         |  '(' <expr> <expr> ')'
+
+data Expr
+    = Lam Expr Expr
+    | App Expr Expr
+    | Var String
+    deriving (Eq, Ord)
+
+instance Show Expr where
+    show (Var s)         = s
+    show (Lam (Var s) e) = "(\\" ++ s ++ "." ++ show e ++ ")"
+    show (App m n)       = show m ++ " " ++ show n
+
+
 parseToken :: Token -> Parser Token
 parseToken tok = Parser $ \toks -> case toks of
     (t:ts) | t == tok -> [(t, ts)]
     _                 -> []
-
-
 
 parseInt :: Parser Int
 parseInt = Parser $ \toks -> case toks of
     (TokInt n:ts) -> [(n, ts)]
     _             -> []
 
-parseIdent :: Parser Expr
+parseIdent :: Parser String
 parseIdent = Parser $ \toks -> case toks of
-    (TokIdent s:ts) -> [(Ident s, ts)]
+    (TokIdent s:ts) -> [(s, ts)]
     _               -> []
 
 
--- <expr> ::= <const>
---         | <ident>
---         | '\' <ident> '.' <expr>
---         | '(' <expr> <expr> ')'
---         | '(' '+' <expr> ')'
---         | '(' '-' <expr> ')'
---         | '(' '*' <expr> ')'
---         | '(' '/' <expr> ')'
+parseVar :: Parser Expr
+parseVar =
+    Var <$> parseIdent
 
-parseConst :: Parser Expr
-parseConst =
-    Const <$> parseInt
+
+parseLam :: Parser Expr
+parseLam = do
+    parseToken (TokSym '\\')
+    vs <- some parseVar
+    parseToken TokArr
+    e <- parseExpr
+    return $ foldr1 Lam (vs ++ [e])
 
 
 parseApp :: Parser Expr
@@ -141,94 +141,41 @@ parseApp = do
     parseToken (TokSym ')')
     return (App a b)
 
-parseLamb :: Parser Expr
-parseLamb = do
-    parseToken (TokSym '\\')
-    id <- parseIdent
-    parseToken (TokSym '.')
-    Lamb id <$> parseExpr
 
 parseExpr :: Parser Expr
-parseExpr =
-    parseConst <|>
-    parseIdent <|>
-    parseLamb  <|>
-    parseApp <|>
-
+parseExpr = parseVar <|> parseLam <|> parseApp
+    
 
 parse :: [Token] -> Expr
-parse toks = case filter (null . snd) (getParser parseExpr $ toks) of
+parse toks = case (Set.toList $ Set.fromList $ filter (null . snd) (getParser parseExpr $ toks)) of
     []        -> error "can't parse"
     [(e, [])] -> e
-    _         -> error "more than one parse"
+    x         -> error ("more than one parse" ++ show x)
+
+fv :: [String] -> Expr -> [String]
+fv vs (Var s)
+    | s `elem` vs = []
+    | otherwise   = [s]
+fv vs (App a b)    = union (fv vs a) (fv vs b)
+fv vs (Lam (Var s) e)    = fv (s:vs) e
 
 
-compile :: Expr -> ModuleBuilder ()
-compile expr =
-    void $ function (mkName "main") [] i64 $ \_ ->
-        ret =<< compileExpr expr
-
-
-compileExpr :: Monad m => Expr -> IRBuilderT m Operand
-compileExpr e = case e of
-    Const n         -> return $ int64 (fromIntegral n)
-
-
-withMyHostTargetMachine :: (TargetMachine -> IO ()) -> IO ()
-withMyHostTargetMachine f = do
-    initializeNativeTarget
-    triple <- getProcessTargetTriple
-    cpu <- getHostCPUName
-    features <- getHostCPUFeatures
-    (target, _) <- lookupTarget Nothing triple
-    withTargetOptions $ \options ->
-        withTargetMachine target triple cpu features options reloc model genOpt f
-    where
-        reloc  = Reloc.PIC
-        model  = CodeModel.Default
-        genOpt = CodeGenOpt.None
-
-
-withSession :: (Context -> ExecutionSession -> IRCompileLayer ObjectLinkingLayer -> IO ()) -> IO ()
-withSession f = do
-    resolvers <- newIORef []
-    withContext $ \ctx -> 
-        withExecutionSession $ \es ->
-            withMyHostTargetMachine $ \tm -> 
-                withObjectLinkingLayer es (\_ -> head <$> readIORef resolvers) $ \oll ->
-                    withIRCompileLayer oll tm $ \cl ->
-                        withSymbolResolver es (myResolver cl) $ \psr -> do
-                            writeIORef resolvers [psr]
-                            f ctx es cl
-                                
-    where
-        myResolver :: IRCompileLayer ObjectLinkingLayer -> SymbolResolver
-        myResolver cl = SymbolResolver $ \mangled -> do
-            symbol <- findSymbol cl mangled False
-            when (isLeft symbol) (error "symbol resolver error")
-            return symbol
-
-
-jitAndRunMain :: [Definition] -> ExecutionSession -> Context -> IRCompileLayer ObjectLinkingLayer -> IO Int
-jitAndRunMain defs es ctx cl = do
-    let astmod = defaultModule { moduleDefinitions = defs }
-    withModuleKey es $ \modKey ->
-        M.withModuleFromAST ctx astmod $ \mod -> do
-            addModule cl modKey mod
-            mangled <- mangleSymbol cl "main"
-            Right (JITSymbol fn _) <- findSymbolIn cl modKey mangled False
-            r <- run $ castPtrToFunPtr (wordPtrToPtr fn)
-            removeModule cl modKey
-            return r
-
+babs env (Lam x e)
+    | y@(Var _) <- t, x == y         = App (App (Var "s") (Var "k")) (Var "k")
+    | Var a <- x, a`notElem` fv [] t = App (Var "k") t
+    | App m n <- t                   = App (App (Var "s") (babs env $ Lam x m)) (babs env $ Lam x n)
+    where t = babs env e
+babs env (Var s)
+    | Just t <- lookup s env = babs env t
+    | otherwise              = Var s
+babs env (App m n)           = App (babs env m) (babs env n)
 
 main :: IO ()
-main =
-    withSession $ \ctx es cl -> do
-        line <- getLine
-        let expr = parse (lexTokens line)
-        let defs = execModuleBuilder emptyModuleBuilder (compile expr)
-        n <- jitAndRunMain defs es ctx cl
-        putStrLn (show n)
+main = do
+    line <- getLine
+    let expr = parse (lexTokens line)
+    putStrLn (show expr)
+    putStrLn (show $ babs [] expr)
+    main
 
 
