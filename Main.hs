@@ -68,7 +68,7 @@ instance MonadFail Parser where
     fail = error
 
 
-syms = ['+', '-', '*', '/', '\\', '.', '(', ')']
+syms = ['+', '-', '*', '/', '\\', '.', '(', ')', '=']
 
 
 lexToken :: String -> (Token, String) 
@@ -87,20 +87,25 @@ lexTokens s = case lexToken s of
     (tok, s)  -> (tok:lexTokens s)
 
 
--- <expr> ::= <var>
---         |  '\' <var>+ '->' <expr>
---         |  '(' <expr> <expr> ')'
+-- <closed> ::= '(' <open> ')'
+--           |  <var>
+--
+-- <open> ::= '\' <var>+ '->' <open>
+--         |   <closed>+
+-- 
+-- <expr> ::= <open> | <closed>
+
 
 data Expr
-    = Lam Expr Expr
+    = Lam String Expr
     | App Expr Expr
     | Var String
     deriving (Eq, Ord)
 
 instance Show Expr where
-    show (Var s)         = s
-    show (Lam (Var s) e) = "(\\" ++ s ++ "." ++ show e ++ ")"
-    show (App m n)       = show m ++ " " ++ show n
+    show (Var s)   = s
+    show (Lam s e) = "\0955" ++ s ++ "." ++ show e
+    show (App m n) = "(" ++ show m ++ " " ++ show n ++ ")"
 
 
 parseToken :: Token -> Parser Token
@@ -118,64 +123,98 @@ parseIdent = Parser $ \toks -> case toks of
     (TokIdent s:ts) -> [(s, ts)]
     _               -> []
 
-
 parseVar :: Parser Expr
 parseVar =
     Var <$> parseIdent
 
-
 parseLam :: Parser Expr
 parseLam = do
     parseToken (TokSym '\\')
-    vs <- some parseVar
+    ss <- some parseIdent
     parseToken TokArr
-    e <- parseExpr
-    return $ foldr1 Lam (vs ++ [e])
-
+    e <- parseOpen
+    return (foldr Lam e ss)
 
 parseApp :: Parser Expr
 parseApp = do
-    parseToken (TokSym '(')
-    a <- parseExpr
-    b <- parseExpr
-    parseToken (TokSym ')')
-    return (App a b)
+    foldl1 App <$> some parseClosed
 
+parseOpen :: Parser Expr
+parseOpen = parseLam <|> parseApp
+
+parseClosed :: Parser Expr
+parseClosed = parseVar <|> do
+    parseToken (TokSym '(')
+    e <- parseOpen
+    parseToken (TokSym ')')
+    return e
 
 parseExpr :: Parser Expr
-parseExpr = parseVar <|> parseLam <|> parseApp
+parseExpr = parseOpen
     
 
-parse :: [Token] -> Expr
-parse toks = case (Set.toList $ Set.fromList $ filter (null . snd) (getParser parseExpr $ toks)) of
+parseAssign :: Parser (String, Expr)
+parseAssign = do
+    id <- parseIdent
+    parseToken (TokSym '=')
+    e <- parseExpr
+    return (id, e)
+
+
+data Line
+    = Assign String Expr
+    | Eval Expr
+    deriving (Show, Eq, Ord)
+
+
+parseLine :: Parser Line
+parseLine = (Eval <$> parseExpr) <|> ((\(s, e) -> Assign s e) <$> parseAssign)
+
+parse :: [Token] -> Line
+parse toks = case (Set.toList $ Set.fromList $ filter (null . snd) (getParser parseLine $ toks)) of
     []        -> error "can't parse"
-    [(e, [])] -> e
+    [(l, [])] -> l
     x         -> error ("more than one parse" ++ show x)
 
-fv :: [String] -> Expr -> [String]
-fv vs (Var s)
-    | s `elem` vs = []
-    | otherwise   = [s]
-fv vs (App a b)    = union (fv vs a) (fv vs b)
-fv vs (Lam (Var s) e)    = fv (s:vs) e
 
+freeVars :: [String] -> Expr -> [String]
+freeVars vs (Var s)   = if s `elem` vs then [] else [s]
+freeVars vs (App a b) = union (freeVars vs a) (freeVars vs b)
+freeVars vs (Lam s e) = freeVars (s:vs) e
+--
+--
+--combinate :: [(String, Expr)] -> Expr -> Expr
+--combinate env (Lam s e) = case combinate env e of
+--    Var s' | s' == s                    -> App (App (Var "s") (Var "k")) (Var "k")
+--    e'     | s `notElem` freeVars [] e' -> App (Var "k") e'
+--    App m n                             -> App (App (Var "s") (combinate env $ Lam s m)) (combinate env $ Lam s n)
+--combinate env (Var s) = case lookup s env of
+--    Just t  -> combinate env t
+--    Nothing -> Var s
+--combinate env (App m n) = App (combinate env m) (combinate env n)
+--
 
-babs env (Lam x e)
-    | y@(Var _) <- t, x == y         = App (App (Var "s") (Var "k")) (Var "k")
-    | Var a <- x, a`notElem` fv [] t = App (Var "k") t
-    | App m n <- t                   = App (App (Var "s") (babs env $ Lam x m)) (babs env $ Lam x n)
-    where t = babs env e
-babs env (Var s)
-    | Just t <- lookup s env = babs env t
-    | otherwise              = Var s
-babs env (App m n)           = App (babs env m) (babs env n)
+eval :: [(String, Expr)] -> Expr -> Expr
+eval env (Var s) | Just e <- lookup s env  = eval env e
+eval env (Var s)                           = Var s
+eval env (Lam s e)                         = Lam s e
+eval env (App (Lam s e) n)                 = eval (insert (s, n) env) e
+eval env (App m n)                         = eval env $ App (eval env m) (eval env n)
 
 main :: IO ()
-main = do
-    line <- getLine
-    let expr = parse (lexTokens line)
-    putStrLn (show expr)
-    putStrLn (show $ babs [] expr)
-    main
+main = repl []
+    where
+        repl :: [(String, Expr)] -> IO ()
+        repl env = do
+            line <- getLine
+            case line of
+                'q':_ -> return ()
+                _     -> do
+                    case parse (lexTokens line) of
+                        Assign id e -> repl $ insert (id, e) env
+                        Eval e      -> do
+                            putStrLn $ "eval:     " ++ show (eval env e)
+                            repl env
+            
 
 
